@@ -19,7 +19,7 @@ from sklearn.metrics import (
 # ===== 1) General parameters =====
 RANDOM_STATE = 42
 BASE_DIR = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-CSV_PATH = os.path.join(BASE_DIR, "../../OneDrive/מסמכים/הנדסת נתונים/שנה ג/סמסטר ב/סדנת הכנה לפרויקט/data", "bigml.csv")   # <--- your file is in data/bigml.csv
+CSV_PATH = "data/bigml.csv"
 
 # Selected features / label
 FEATURES = ["Country", "Loan Amount", "Sector", "Activity"]
