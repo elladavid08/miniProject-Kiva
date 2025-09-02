@@ -1,0 +1,15 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments (במידה והם בתוך הפרויקט)
+.venv/
+venv/
+
+# Logs (לבחירה)
+*.log
+
+# Project data
+data/bigml.csv
+!data/.gitkeep
