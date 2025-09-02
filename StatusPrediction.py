@@ -28,8 +28,9 @@ LABEL_COL = "Status"
 # Undersampling ratio on TRAIN ONLY: how many "paid" per "defaulted"
 PAID_TO_DEFAULTED_RATIO = 2
 
+
 # Decision threshold on P(paid) used for evaluation (slight recall preference for defaulted)
-THRESHOLD_PAID = 0.60
+# THRESHOLD_PAID = 0.60
 
 
 # ===== 2) Load and clean data =====
@@ -177,7 +178,8 @@ def evaluate_model(model_name: str, y_true, y_pred, y_proba_paid, threshold_used
     print(f"\nDEFAULTED class → Precision: {precision[0]:.3f} | Recall: {recall[0]:.3f} | F1: {f1[0]:.3f}\n")
 
 
-def evaluate_model_summary(model_name: str, y_true, y_pred, y_proba_paid, results_list: list, threshold_used: float | None):
+def evaluate_model_summary(model_name: str, y_true, y_pred, y_proba_paid, results_list: list,
+                           threshold_used: float | None):
     """
     Collects model performance into results_list for summary table.
     Stores: model, threshold, AUC(defaulted), Precision/Recall/F1(defaulted).
@@ -197,16 +199,42 @@ def evaluate_model_summary(model_name: str, y_true, y_pred, y_proba_paid, result
     })
 
 
+# --- NEW: F-beta for the DEFAULTED class (label=0)
+def fbeta_defaulted(y_true, y_pred, beta=1.2):
+    """
+    Compute F_beta for the DEFAULTED class (label=0).
+    beta>1 slightly favors Recall over Precision.
+    """
+    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, labels=[0], average=None)
+    p0, r0 = p[0], r[0]
+    beta2 = beta * beta
+    return (1 + beta2) * (p0 * r0) / (beta2 * p0 + r0 + 1e-12), p0, r0
+
+
+# --- NEW: scan thresholds on validation and pick the best by F_beta for DEFAULTED
+def find_best_threshold_on_val(y_true_val, y_proba_paid_val, beta=1.2,
+                               t_min=0.20, t_max=0.80, steps=121):
+    """
+    Sweep thresholds on P(paid), return the one maximizing F_beta for DEFAULTED.
+    """
+    best = {"thr": 0.5, "fbeta": -1.0, "prec": 0.0, "rec": 0.0}
+    for t in np.linspace(t_min, t_max, steps):
+        y_pred_val = (y_proba_paid_val >= t).astype(int)  # 1=paid, else defaulted
+        fbeta, p0, r0 = fbeta_defaulted(y_true_val, y_pred_val, beta=beta)
+        if fbeta > best["fbeta"]:
+            best = {"thr": float(t), "fbeta": float(fbeta),
+                    "prec": float(p0), "rec": float(r0)}
+    return best
+
+
 # ===== 8) main =====
 def main():
     # Load full data (paid/defaulted only)
     df = load_and_clean(CSV_PATH)
-
-    # Show full distribution (real-world after removing refunded)
     print("Full class distribution (after removing 'refunded'):")
     print(df["label"].value_counts())
 
-    # Split BEFORE any sampling; keep test as-is (realistic evaluation)
+    # Split once to Train/Test (Test remains untouched = real-world)
     X = df[FEATURES].copy()
     y = df["label"].copy()
 
@@ -218,52 +246,79 @@ def main():
     print("\nTest distribution (unchanged):")
     print(y_test.value_counts())
 
-    # Build a TRAIN DataFrame with label for undersampling
-    df_train = X_train.copy()
-    df_train["label"] = y_train.values
+    # Inner split: Train -> (Inner-Train, Validation)
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train, y_train, test_size=0.20, random_state=RANDOM_STATE, stratify=y_train
+    )
 
-    # Undersample TRAIN only
-    df_train_bal = undersample(df_train, ratio_paid_to_defaulted=PAID_TO_DEFAULTED_RATIO)
-    print("\nTrain distribution AFTER undersampling:")
-    print(df_train_bal["label"].value_counts())
+    # Undersample on INNER-TRAIN only
+    df_tr = X_tr.copy()
+    df_tr["label"] = y_tr.values
+    df_tr_bal = undersample(df_tr, ratio_paid_to_defaulted=PAID_TO_DEFAULTED_RATIO)
+    print("\nInner-train distribution AFTER undersampling:")
+    print(df_tr_bal["label"].value_counts())
 
-    # Re-split X_train_bal / y_train_bal
-    X_train_bal = df_train_bal[FEATURES].copy()
-    y_train_bal = df_train_bal["label"].copy()
+    X_tr_bal = df_tr_bal[FEATURES].copy()
+    y_tr_bal = df_tr_bal["label"].copy()
 
-    # Prepare models
     models = get_models()
     results = []
+    chosen_thresholds = {}
 
     for name, clf in models.items():
         pipe = build_pipeline(clf)
 
-        # Fit on undersampled TRAIN
+        # 1) Train on undersampled INNER-TRAIN
+        pipe.fit(X_tr_bal, y_tr_bal)
+
+        # 2) Choose threshold on VALIDATION by maximizing F_{1.2} for DEFAULTED
+        if hasattr(pipe.named_steps["clf"], "predict_proba"):
+            y_proba_paid_val = pipe.predict_proba(X_val)[:, 1]
+        else:
+            decision = pipe.decision_function(X_val)
+            y_proba_paid_val = (decision - decision.min()) / (decision.max() - decision.min() + 1e-9)
+
+        best = find_best_threshold_on_val(
+            y_val, y_proba_paid_val, beta=1.2, t_min=0.20, t_max=0.80, steps=121
+        )
+        chosen_thresholds[name] = best["thr"]
+        print(f"\n[{name}] best threshold on validation (F1.2): "
+              f"{best['thr']:.3f} | F1.2={best['fbeta']:.3f} | "
+              f"P0={best['prec']:.3f} | R0={best['rec']:.3f}")
+
+        # 3) (Optional, recommended) Refit on ALL TRAIN undersampled for stability
+        df_train_full = X_train.copy()
+        df_train_full["label"] = y_train.values
+        df_train_full_bal = undersample(df_train_full, ratio_paid_to_defaulted=PAID_TO_DEFAULTED_RATIO)
+        X_train_bal = df_train_full_bal[FEATURES].copy()
+        y_train_bal = df_train_full_bal["label"].copy()
         pipe.fit(X_train_bal, y_train_bal)
 
-        # Probabilities for paid (positive class)
+        # 4) Evaluate once on TEST using the chosen threshold
         if hasattr(pipe.named_steps["clf"], "predict_proba"):
-            y_proba_paid = pipe.predict_proba(X_test)[:, 1]
+            y_proba_paid_test = pipe.predict_proba(X_test)[:, 1]
         else:
-            # fallback: use decision_function normalized to [0,1]
             decision = pipe.decision_function(X_test)
-            y_proba_paid = (decision - decision.min()) / (decision.max() - decision.min() + 1e-9)
+            y_proba_paid_test = (decision - decision.min()) / (decision.max() - decision.min() + 1e-9)
 
-        # Apply custom threshold on P(paid)
-        y_pred_thresh = (y_proba_paid >= THRESHOLD_PAID).astype(int)
+        thr = chosen_thresholds[name]
+        y_pred_test = (y_proba_paid_test >= thr).astype(int)
 
-        # Detailed evaluation (with threshold info)
-        evaluate_model(name, y_test, y_pred_thresh, y_proba_paid, threshold_used=THRESHOLD_PAID)
+        # Detailed + summary
+        evaluate_model(name, y_test, y_pred_test, y_proba_paid_test, threshold_used=thr)
+        evaluate_model_summary(name, y_test, y_pred_test, y_proba_paid_test, results, threshold_used=thr)
 
-        # Summary row
-        evaluate_model_summary(name, y_test, y_pred_thresh, y_proba_paid, results, threshold_used=THRESHOLD_PAID)
-
-    # Print summary table
+    # Summary table
     print("\n==== Summary Table (focus: defaulted class) ====")
     df_results = pd.DataFrame(results)
-    # Order columns nicely
-    df_results = df_results[["Model", "Threshold (Ppaid)", "AUC (defaulted)", "Precision (defaulted)", "Recall (defaulted)", "F1 (defaulted)"]]
+    df_results = df_results[["Model", "Threshold (Ppaid)", "AUC (defaulted)",
+                             "Precision (defaulted)", "Recall (defaulted)", "F1 (defaulted)"]]
     print(df_results.to_string(index=False))
+
+    # Show the chosen thresholds per model
+    print("\nChosen thresholds by model (P(paid)):")
+    for name, thr in chosen_thresholds.items():
+        print(f"  {name}: {thr:.3f}")
 
 
 if __name__ == "__main__":
