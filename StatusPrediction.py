@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import pandas as pd
 
@@ -13,313 +12,314 @@ from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 
 from sklearn.metrics import (
-    roc_auc_score, classification_report, confusion_matrix, precision_recall_fscore_support
+    roc_auc_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_fscore_support
 )
 
-# ===== 1) General parameters =====
+# =========================
+# Config (kept from your flow)
+# =========================
+DEFAULT_FEATURES = ["Country", "Loan Amount", "Sector", "Activity"]
+
+TEST_SIZE = 0.2
+VAL_SIZE = 0.2            # portion of TRAIN that becomes validation
 RANDOM_STATE = 42
-BASE_DIR = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
-CSV_PATH = "data/bigml.csv"
 
-# Selected features / label
-FEATURES = ["Country", "Loan Amount", "Sector", "Activity"]
-LABEL_COL = "Status"
+# undersampling: keep paid ~ R * (#defaulted) in the *inner-train* only
+PAID_TO_DEFAULTED_RATIO = 2.0
 
-# Undersampling ratio on TRAIN ONLY: how many "paid" per "defaulted"
-PAID_TO_DEFAULTED_RATIO = 2
+# threshold tuning: maximize F_beta (beta>1 biases recall); we bias recall to avoid missing defaults
+F_BETA = 2.0
 
-
-# Decision threshold on P(paid) used for evaluation (slight recall preference for defaulted)
-# THRESHOLD_PAID = 0.60
+THRESHOLD_GRID = np.round(np.linspace(0.05, 0.95, 19), 3)  # thresholds on P(paid)
 
 
-# ===== 2) Load and clean data =====
-def load_and_clean(csv_path: str) -> pd.DataFrame:
+# =========================
+# Helpers
+# =========================
+def _prep_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Reads CSV, removes 'refunded' rows, and creates a binary label:
-    paid -> 1, defaulted -> 0
+    Keep only rows with Status in {'paid','defaulted'}, map label, and coerce numeric.
+    label: 1 = paid, 0 = defaulted
     """
-    df = pd.read_csv(csv_path)
+    df = df.copy()
 
-    # Ensure required columns exist
-    missing = [c for c in FEATURES + [LABEL_COL] if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in CSV: {missing}")
+    # Keep only paid & defaulted (drop refunded & others)
+    df = df[df["Status"].isin(["paid", "defaulted"])].copy()
 
-    # Keep only paid/defaulted
-    df = df[df[LABEL_COL].str.lower().isin(["paid", "defaulted"])].copy()
+    # Map label: paid -> 1, defaulted -> 0
+    df["label"] = (df["Status"] == "paid").astype(int)
 
-    # Binary label
-    df["label"] = (df[LABEL_COL].str.lower() == "paid").astype(int)
-
-    # Ensure numeric dtype for Loan Amount
-    if not np.issubdtype(df["Loan Amount"].dtype, np.number):
+    # Ensure Loan Amount is numeric
+    if "Loan Amount" in df.columns:
         df["Loan Amount"] = pd.to_numeric(df["Loan Amount"], errors="coerce")
 
     return df
 
 
-# ===== 3) Undersampling (TRAIN only) =====
-def undersample(df: pd.DataFrame, ratio_paid_to_defaulted: int = 2) -> pd.DataFrame:
+def _undersample_inner_train(X_in: pd.DataFrame, y_in: pd.Series, ratio_paid_to_defaulted: float, seed: int):
     """
-    Keep all defaulted, sample paid according to the given ratio.
-    Expects a DataFrame that already contains the 'label' column.
+    Random undersampling on inner-train:
+      - keep all DEFAULTED (y==0)
+      - sample PAID (y==1) so that count_paid ~= ratio * count_defaulted
+    Returns new X_res, y_res (shuffled).
     """
-    df_defaulted = df[df["label"] == 0]
-    df_paid = df[df["label"] == 1]
+    rng = np.random.RandomState(seed)
 
-    n_def = len(df_defaulted)
-    n_paid_sample = min(len(df_paid), n_def * ratio_paid_to_defaulted)
+    idx_defaulted = np.where(y_in == 0)[0]
+    idx_paid = np.where(y_in == 1)[0]
 
-    df_paid_sample = df_paid.sample(n=n_paid_sample, random_state=RANDOM_STATE)
-    df_balanced = pd.concat([df_defaulted, df_paid_sample], axis=0).sample(frac=1.0, random_state=RANDOM_STATE)
-    return df_balanced.reset_index(drop=True)
+    n_def = len(idx_defaulted)
+    n_paid_target = int(round(ratio_paid_to_defaulted * n_def))
+
+    if n_paid_target >= len(idx_paid):
+        # if target >= available, just keep all paid
+        chosen_paid = idx_paid
+    else:
+        chosen_paid = rng.choice(idx_paid, size=n_paid_target, replace=False)
+
+    chosen_idx = np.concatenate([idx_defaulted, chosen_paid])
+    rng.shuffle(chosen_idx)
+
+    return X_in.iloc[chosen_idx], y_in.iloc[chosen_idx]
 
 
-# ===== 4) Preprocessing =====
-def build_preprocessor():
+def _build_preprocessor():
     """
-    Returns a ColumnTransformer:
-    - Numeric: impute + scale
-    - Categorical: impute + one-hot encode
+    ColumnTransformer for our 4 features:
+      - numeric: ["Loan Amount"]
+      - categorical: ["Country", "Sector", "Activity"]
     """
     numeric_features = ["Loan Amount"]
     categorical_features = ["Country", "Sector", "Activity"]
 
-    numeric_pipe = Pipeline(steps=[
+    numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler(with_mean=False))  # with_mean=False for sparse support
+        ("scaler", StandardScaler())
     ])
 
-    categorical_pipe = Pipeline(steps=[
+    categorical_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=True))
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
     ])
 
     preprocessor = ColumnTransformer(
         transformers=[
-            ("num", numeric_pipe, numeric_features),
-            ("cat", categorical_pipe, categorical_features),
-        ],
-        remainder="drop"
+            ("num", numeric_transformer, numeric_features),
+            ("cat", categorical_transformer, categorical_features),
+        ]
     )
     return preprocessor
 
 
-# ===== 5) Models =====
-def get_models():
+def _f_beta(precision, recall, beta: float):
+    if precision == 0 and recall == 0:
+        return 0.0
+    b2 = beta * beta
+    return (1 + b2) * (precision * recall) / (b2 * precision + recall + 1e-12)
+
+
+def _metrics_for_defaulted(y_true, y_pred):
     """
-    Returns a dictionary of models to train and compare.
+    Return precision/recall/F1 for DEFAULTED class only (label=0).
     """
-    models = {
-        "logreg": LogisticRegression(
-            max_iter=1000,
-            solver="liblinear",
-        ),
-        "rf": RandomForestClassifier(
-            n_estimators=300,
-            max_depth=None,
-            random_state=RANDOM_STATE,
-            n_jobs=-1
-        ),
-        "xgb": XGBClassifier(
-            n_estimators=400,
-            learning_rate=0.07,
-            max_depth=6,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            random_state=RANDOM_STATE,
-            eval_metric="logloss",
-            n_jobs=-1,
-            tree_method="hist"
-        ),
-    }
-    return models
+    p, r, f, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=[0], average=None, zero_division=0
+    )
+    return float(p[0]), float(r[0]), float(f[0])
 
 
-# ===== 6) Build pipeline (preprocessing + model) =====
-def build_pipeline(model):
-    preprocessor = build_preprocessor()
-    pipe = Pipeline(steps=[
-        ("pre", preprocessor),
-        ("clf", model)
-    ])
-    return pipe
-
-
-# ===== 7) Evaluation helpers =====
-def evaluate_model(model_name: str, y_true, y_pred, y_proba_paid, threshold_used: float | None = None):
+def _pick_best_threshold_on_validation(y_val, p_paid_val, beta: float):
     """
-    Prints detailed evaluation:
-    - AUC (paid & defaulted as positive)
-    - Classification report
-    - Confusion Matrix
-    - Precision/Recall/F1 for defaulted (label=0)
+    Scan THRESHOLD_GRID on P(paid) and pick threshold that maximizes F_beta for DEFAULTED.
+    Prediction rule: pred_paid = (p_paid >= thr) else defaulted.
     """
-    y_proba_defaulted = 1.0 - y_proba_paid
-    auc_paid = roc_auc_score(y_true, y_proba_paid)
-    auc_defaulted = roc_auc_score(1 - y_true, y_proba_defaulted)
+    best_thr, best_f = None, -1.0
+    best_prec0, best_rec0 = 0.0, 0.0
 
+    for thr in THRESHOLD_GRID:
+        y_pred = (p_paid_val >= thr).astype(int)
+        p0, r0, _ = _metrics_for_defaulted(y_val, y_pred)
+        f = _f_beta(p0, r0, beta)
+        if f > best_f:
+            best_f, best_thr = f, thr
+            best_prec0, best_rec0 = p0, r0
+
+    return best_thr, best_f, best_prec0, best_rec0
+
+
+def _evaluate_on_test(y_test, p_paid_test, thr: float, model_name: str):
+    """
+    Produce prints and metric dict for a single model on the TEST set using chosen threshold.
+    """
+    # AUC (paid positive)
+    auc_paid = roc_auc_score(y_test, p_paid_test)
+    # AUC if you flip to "defaulted positive" (same numeric value, computed properly)
+    auc_defaulted = roc_auc_score(1 - y_test, 1 - p_paid_test)
+
+    # Apply threshold on P(paid) to get labels
+    y_pred = (p_paid_test >= thr).astype(int)
+
+    # Reports
     print(f"\n==== Results for model: {model_name} ====")
-    if threshold_used is not None:
-        print(f"(Evaluated with custom threshold on P(paid) = {threshold_used:.2f})")
+    print(f"(Evaluated with custom threshold on P(paid) = {thr:.2f})")
     print(f"AUC (paid positive):      {auc_paid:.4f}")
     print(f"AUC (defaulted positive): {auc_defaulted:.4f}\n")
 
     print("Classification report (target_names=[defaulted, paid]):")
-    print(classification_report(y_true, y_pred, target_names=["defaulted", "paid"]))
+    print(classification_report(
+        y_test,
+        y_pred,
+        target_names=["defaulted", "paid"],
+        zero_division=0
+    ))
 
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
+    cm_df = pd.DataFrame(cm, index=["true_defaulted", "true_paid"],
+                         columns=["pred_defaulted", "pred_paid"])
     print("Confusion Matrix (rows=true, cols=pred):")
-    print(pd.DataFrame(cm, index=["true_defaulted", "true_paid"], columns=["pred_defaulted", "pred_paid"]))
+    print(cm_df, "\n")
 
-    # Metrics for defaulted (label=0)
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, labels=[0], average=None)
-    print(f"\nDEFAULTED class → Precision: {precision[0]:.3f} | Recall: {recall[0]:.3f} | F1: {f1[0]:.3f}\n")
+    # Defaulted-only metrics
+    p0, r0, f0 = _metrics_for_defaulted(y_test, y_pred)
+    print(f"DEFAULTED class → Precision: {p0:.3f} | Recall: {r0:.3f} | F1: {f0:.3f}\n")
+
+    return {
+        "auc": float(auc_paid),
+        "threshold": float(thr),
+        "precision0": float(p0),
+        "recall0": float(r0),
+        "f1_0": float(f0),
+    }
 
 
-def evaluate_model_summary(model_name: str, y_true, y_pred, y_proba_paid, results_list: list,
-                           threshold_used: float | None):
+# =========================
+# Public API
+# =========================
+def train_status_models(df: pd.DataFrame):
     """
-    Collects model performance into results_list for summary table.
-    Stores: model, threshold, AUC(defaulted), Precision/Recall/F1(defaulted).
+    Train/validate/test 3 models (LogReg, RF, XGB) for default vs paid on the Kiva data.
+    - Removes 'refunded'
+    - Splits train/test (TEST_SIZE)
+    - Splits inner train/validation (VAL_SIZE)
+    - Random-undersamples PAID in inner-train: paid ~= R * defaulted (R=PAID_TO_DEFAULTED_RATIO)
+    - Tunes a probability threshold on P(paid) by maximizing F_beta (beta=F_BETA) for DEFAULTED on validation
+    - Evaluates on the untouched TEST set with the chosen threshold
+    - Prints detailed results and returns a dict with per-model metrics
+
+    Returns
+    -------
+    dict: {
+        "logreg": {"model": Pipeline, "threshold": float, "auc": float, "precision0": float, "recall0": float, "f1_0": float},
+        "rf":     {...},
+        "xgb":    {...}
+    }
     """
-    y_proba_defaulted = 1.0 - y_proba_paid
-    auc_defaulted = roc_auc_score(1 - y_true, y_proba_defaulted)
+    df = _prep_df(df)
 
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, labels=[0], average=None)
+    # Features / target
+    X = df[DEFAULT_FEATURES].copy()
+    y = df["label"].values  # 1=paid, 0=defaulted
 
-    results_list.append({
-        "Model": model_name,
-        "Threshold (Ppaid)": threshold_used if threshold_used is not None else 0.50,
-        "AUC (defaulted)": round(auc_defaulted, 4),
-        "Precision (defaulted)": round(precision[0], 3),
-        "Recall (defaulted)": round(recall[0], 3),
-        "F1 (defaulted)": round(f1[0], 3),
-    })
-
-
-# --- NEW: F-beta for the DEFAULTED class (label=0)
-def fbeta_defaulted(y_true, y_pred, beta=1.2):
-    """
-    Compute F_beta for the DEFAULTED class (label=0).
-    beta>1 slightly favors Recall over Precision.
-    """
-    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, labels=[0], average=None)
-    p0, r0 = p[0], r[0]
-    beta2 = beta * beta
-    return (1 + beta2) * (p0 * r0) / (beta2 * p0 + r0 + 1e-12), p0, r0
-
-
-# --- NEW: scan thresholds on validation and pick the best by F_beta for DEFAULTED
-def find_best_threshold_on_val(y_true_val, y_proba_paid_val, beta=1.2,
-                               t_min=0.20, t_max=0.80, steps=121):
-    """
-    Sweep thresholds on P(paid), return the one maximizing F_beta for DEFAULTED.
-    """
-    best = {"thr": 0.5, "fbeta": -1.0, "prec": 0.0, "rec": 0.0}
-    for t in np.linspace(t_min, t_max, steps):
-        y_pred_val = (y_proba_paid_val >= t).astype(int)  # 1=paid, else defaulted
-        fbeta, p0, r0 = fbeta_defaulted(y_true_val, y_pred_val, beta=beta)
-        if fbeta > best["fbeta"]:
-            best = {"thr": float(t), "fbeta": float(fbeta),
-                    "prec": float(p0), "rec": float(r0)}
-    return best
-
-
-# ===== 8) main =====
-def main():
-    # Load full data (paid/defaulted only)
-    df = load_and_clean(CSV_PATH)
+    # Basic distributions (after removing refunded)
+    full_counts = pd.Series(y).value_counts().rename(index={1: "1 (paid)", 0: "0 (defaulted)"})
     print("Full class distribution (after removing 'refunded'):")
-    print(df["label"].value_counts())
+    print(full_counts, "\n")
 
-    # Split once to Train/Test (Test remains untouched = real-world)
-    X = df[FEATURES].copy()
-    y = df["label"].copy()
-
+    # Split train/test
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=RANDOM_STATE, stratify=y
-    )
-    print("\nTrain distribution BEFORE undersampling:")
-    print(y_train.value_counts())
-    print("\nTest distribution (unchanged):")
-    print(y_test.value_counts())
-
-    # Inner split: Train -> (Inner-Train, Validation)
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X_train, y_train, test_size=0.20, random_state=RANDOM_STATE, stratify=y_train
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
     )
 
-    # Undersample on INNER-TRAIN only
-    df_tr = X_tr.copy()
-    df_tr["label"] = y_tr.values
-    df_tr_bal = undersample(df_tr, ratio_paid_to_defaulted=PAID_TO_DEFAULTED_RATIO)
-    print("\nInner-train distribution AFTER undersampling:")
-    print(df_tr_bal["label"].value_counts())
+    print("Train distribution BEFORE undersampling:")
+    print(pd.Series(y_train).value_counts().rename(index={1: "1 (paid)", 0: "0 (defaulted)"}), "\n")
 
-    X_tr_bal = df_tr_bal[FEATURES].copy()
-    y_tr_bal = df_tr_bal["label"].copy()
+    print("Test distribution (unchanged):")
+    print(pd.Series(y_test).value_counts().rename(index={1: "1 (paid)", 0: "0 (defaulted)"}), "\n")
 
-    models = get_models()
-    results = []
-    chosen_thresholds = {}
+    # Inner split (train -> inner-train + val)
+    X_tr_in, X_val, y_tr_in, y_val = train_test_split(
+        X_train, y_train, test_size=VAL_SIZE, random_state=RANDOM_STATE, stratify=y_train
+    )
 
-    for name, clf in models.items():
-        pipe = build_pipeline(clf)
+    # Random undersampling on inner-train
+    X_tr_bal, y_tr_bal = _undersample_inner_train(
+        X_tr_in, pd.Series(y_tr_in), PAID_TO_DEFAULTED_RATIO, seed=RANDOM_STATE
+    )
+    print("Inner-train distribution AFTER undersampling:")
+    print(pd.Series(y_tr_bal).value_counts().rename(index={1: "1 (paid)", 0: "0 (defaulted)"}), "\n")
 
-        # 1) Train on undersampled INNER-TRAIN
+    # Preprocessor
+    preprocessor = _build_preprocessor()
+
+    # Models
+    models = {
+        "logreg": LogisticRegression(max_iter=1000, random_state=RANDOM_STATE, n_jobs=None),
+        "rf": RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1),
+        "xgb": XGBClassifier(
+            n_estimators=400,
+            learning_rate=0.1,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            eval_metric="logloss"
+        ),
+    }
+
+    results = {}
+
+    for name, base_model in models.items():
+        pipe = Pipeline(steps=[
+            ("preprocessor", preprocessor),
+            ("clf", base_model)
+        ])
+
+        # Fit on undersampled inner-train
         pipe.fit(X_tr_bal, y_tr_bal)
 
-        # 2) Choose threshold on VALIDATION by maximizing F_{1.2} for DEFAULTED
-        if hasattr(pipe.named_steps["clf"], "predict_proba"):
-            y_proba_paid_val = pipe.predict_proba(X_val)[:, 1]
-        else:
-            decision = pipe.decision_function(X_val)
-            y_proba_paid_val = (decision - decision.min()) / (decision.max() - decision.min() + 1e-9)
+        # Get validation probabilities for P(paid)
+        p_paid_val = pipe.predict_proba(X_val)[:, 1]
 
-        best = find_best_threshold_on_val(
-            y_val, y_proba_paid_val, beta=1.2, t_min=0.20, t_max=0.80, steps=121
+        # Choose threshold by F_beta (DEFAULTED class focus)
+        best_thr, best_f, best_p0, best_r0 = _pick_best_threshold_on_validation(
+            y_val, p_paid_val, beta=F_BETA
         )
-        chosen_thresholds[name] = best["thr"]
-        print(f"\n[{name}] best threshold on validation (F1.2): "
-              f"{best['thr']:.3f} | F1.2={best['fbeta']:.3f} | "
-              f"P0={best['prec']:.3f} | R0={best['rec']:.3f}")
 
-        # 3) (Optional, recommended) Refit on ALL TRAIN undersampled for stability
-        df_train_full = X_train.copy()
-        df_train_full["label"] = y_train.values
-        df_train_full_bal = undersample(df_train_full, ratio_paid_to_defaulted=PAID_TO_DEFAULTED_RATIO)
-        X_train_bal = df_train_full_bal[FEATURES].copy()
-        y_train_bal = df_train_full_bal["label"].copy()
-        pipe.fit(X_train_bal, y_train_bal)
+        print(f"[{name}] best threshold on validation (F{F_BETA}): {best_thr:.3f} | "
+              f"F{F_BETA}={best_f:.3f} | P0={best_p0:.3f} | R0={best_r0:.3f}")
 
-        # 4) Evaluate once on TEST using the chosen threshold
-        if hasattr(pipe.named_steps["clf"], "predict_proba"):
-            y_proba_paid_test = pipe.predict_proba(X_test)[:, 1]
-        else:
-            decision = pipe.decision_function(X_test)
-            y_proba_paid_test = (decision - decision.min()) / (decision.max() - decision.min() + 1e-9)
+        # Evaluate on test with that threshold
+        p_paid_test = pipe.predict_proba(X_test)[:, 1]
+        metrics_dict = _evaluate_on_test(y_test, p_paid_test, best_thr, name)
 
-        thr = chosen_thresholds[name]
-        y_pred_test = (y_proba_paid_test >= thr).astype(int)
+        # Save results
+        results[name] = {
+            "model": pipe,
+            **metrics_dict
+        }
 
-        # Detailed + summary
-        evaluate_model(name, y_test, y_pred_test, y_proba_paid_test, threshold_used=thr)
-        evaluate_model_summary(name, y_test, y_pred_test, y_proba_paid_test, results, threshold_used=thr)
+    # Summary table (focus on defaulted)
+    print("==== Summary Table (focus: defaulted class) ====")
+    rows = []
+    for name, res in results.items():
+        rows.append({
+            "Model": name,
+            "Threshold (Ppaid)": res["threshold"],
+            "AUC (defaulted)": res["auc"],  # same numeric value, computed on P(paid)
+            "Precision (defaulted)": res["precision0"],
+            "Recall (defaulted)": res["recall0"],
+            "F1 (defaulted)": res["f1_0"],
+        })
+    summary_df = pd.DataFrame(rows)
+    print(summary_df.to_string(index=False))
 
-    # Summary table
-    print("\n==== Summary Table (focus: defaulted class) ====")
-    df_results = pd.DataFrame(results)
-    df_results = df_results[["Model", "Threshold (Ppaid)", "AUC (defaulted)",
-                             "Precision (defaulted)", "Recall (defaulted)", "F1 (defaulted)"]]
-    print(df_results.to_string(index=False))
-
-    # Show the chosen thresholds per model
+    # Also print the chosen thresholds list
     print("\nChosen thresholds by model (P(paid)):")
-    for name, thr in chosen_thresholds.items():
-        print(f"  {name}: {thr:.3f}")
+    for name, res in results.items():
+        print(f"  {name}: {res['threshold']:.3f}")
 
-
-if __name__ == "__main__":
-    main()
+    return results
