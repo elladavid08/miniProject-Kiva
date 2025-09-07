@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import io, joblib
 
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
@@ -10,6 +11,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
+from time import perf_counter
+from sklearn.metrics import average_precision_score, brier_score_loss
 
 from sklearn.metrics import (
     roc_auc_score,
@@ -207,16 +210,29 @@ def train_status_models(df: pd.DataFrame):
     - Random-undersamples PAID in inner-train: paid ~= R * defaulted (R=PAID_TO_DEFAULTED_RATIO)
     - Tunes a probability threshold on P(paid) by maximizing F_beta (beta=F_BETA) for DEFAULTED on validation
     - Evaluates on the untouched TEST set with the chosen threshold
-    - Prints detailed results and returns a dict with per-model metrics
+    - Prints detailed results and returns a dict with per-model metrics + system metrics
 
     Returns
     -------
     dict: {
-        "logreg": {"model": Pipeline, "threshold": float, "auc": float, "precision0": float, "recall0": float, "f1_0": float},
-        "rf":     {...},
-        "xgb":    {...}
+        "<model_name>": {
+            "model": Pipeline,
+            "threshold": float,
+            "auc": float,
+            "precision0": float,
+            "recall0": float,
+            "f1_0": float,
+            # added system/probability metrics:
+            "train_time_s": float,
+            "infer_ms_per_sample": float,
+            "model_size_mb": float,
+            "pr_auc_defaulted": float,
+            "brier_defaulted": float,
+        },
+        ...
     }
     """
+
     df = _prep_df(df)
 
     # Features / target
@@ -278,28 +294,69 @@ def train_status_models(df: pd.DataFrame):
             ("clf", base_model)
         ])
 
-        # Fit on undersampled inner-train
+        # --- Default-initialize system/probability metrics
+        train_time_s = float("nan")
+        infer_ms_per_sample = float("nan")
+        model_size_mb = float("nan")
+        pr_auc_defaulted = float("nan")
+        brier_defaulted = float("nan")
+
+        # --- Train (timed) on undersampled inner-train
+        t0 = perf_counter()
         pipe.fit(X_tr_bal, y_tr_bal)
+        train_time_s = perf_counter() - t0
 
-        # Get validation probabilities for P(paid)
+        # --- Get validation probabilities for P(paid) and choose threshold by F_beta (DEFAULTED focus)
         p_paid_val = pipe.predict_proba(X_val)[:, 1]
-
-        # Choose threshold by F_beta (DEFAULTED class focus)
         best_thr, best_f, best_p0, best_r0 = _pick_best_threshold_on_validation(
             y_val, p_paid_val, beta=F_BETA
         )
-
         print(f"[{name}] best threshold on validation (F{F_BETA}): {best_thr:.3f} | "
               f"F{F_BETA}={best_f:.3f} | P0={best_p0:.3f} | R0={best_r0:.3f}")
 
-        # Evaluate on test with that threshold
-        p_paid_test = pipe.predict_proba(X_test)[:, 1]
+        # --- TEST: probability scores (timed) for P(paid)
+        t0 = perf_counter()
+        if hasattr(pipe.named_steps["clf"], "predict_proba"):
+            p_paid_test = pipe.predict_proba(X_test)[:, 1]
+        elif hasattr(pipe.named_steps["clf"], "decision_function"):
+            dec = pipe.decision_function(X_test)
+            dec_min, dec_max = dec.min(), dec.max()
+            p_paid_test = (dec - dec_min) / (dec_max - dec_min + 1e-9)  # normalize to [0,1]
+        else:
+            # Fallback: use labels as crude probability (still defined so code doesn't break)
+            p_paid_test = pipe.predict(X_test).astype(float)
+        infer_ms_per_sample = (perf_counter() - t0) * 1000.0 / len(X_test)
+
+        # --- Model size (MB)
+        try:
+            buf = io.BytesIO()
+            joblib.dump(pipe, buf)
+            model_size_mb = len(buf.getbuffer()) / (1024 * 1024)
+        except Exception:
+            pass  # keep NaN on failure
+
+        # --- Probabilistic metrics for DEFAULTED as the positive class
+        #     (transform so defaulted=1 and score is P(defaulted)=1-P(paid))
+        y_true_def = (1 - y_test).astype(int)
+        y_score_def = 1.0 - p_paid_test
+        try:
+            pr_auc_defaulted = average_precision_score(y_true_def, y_score_def)
+            brier_defaulted = brier_score_loss(y_true_def, y_score_def)
+        except Exception:
+            pass  # keep NaN on failure
+
+        # --- Evaluate on test with the chosen threshold (prints AUC/Report/CM via helper)
         metrics_dict = _evaluate_on_test(y_test, p_paid_test, best_thr, name)
 
-        # Save results
+        # --- Save results (include system & probability metrics)
         results[name] = {
             "model": pipe,
-            **metrics_dict
+            **metrics_dict,
+            "train_time_s": train_time_s,
+            "infer_ms_per_sample": infer_ms_per_sample,
+            "model_size_mb": model_size_mb,
+            "pr_auc_defaulted": pr_auc_defaulted,
+            "brier_defaulted": brier_defaulted,
         }
 
     # Summary table (focus on defaulted)
@@ -323,3 +380,4 @@ def train_status_models(df: pd.DataFrame):
         print(f"  {name}: {res['threshold']:.3f}")
 
     return results
+

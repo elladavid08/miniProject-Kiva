@@ -57,6 +57,36 @@ def run_repayment_prediction(df):
                 f"\tid: {sample['id']}, Funded Date: {sample['Funded Date']}, Paid Date: {sample['Paid Date']}, predicted_days: {sample['predicted_days']}, predicted_paid_date: {sample['predicted_paid_date']}")
 
 
+def print_system_summary(status_results, repay_results):
+    if status_results:
+        rows = []
+        for name, r in status_results.items():
+            rows.append({
+                "Model": name,
+                "Train time (s)": round(r.get("train_time_s", float("nan")), 3),
+                "Infer time (ms/sample)": round(r.get("infer_ms_per_sample", float("nan")), 3),
+                "Model size (MB)": round(r.get("model_size_mb", float("nan")), 3),
+                "PR-AUC (defaulted)": round(r.get("pr_auc_defaulted", float("nan")), 4),
+                "Brier (defaulted)": round(r.get("brier_defaulted", float("nan")), 4),
+            })
+        print("\n=== System & Prob. Metrics — Status Models ===")
+        print(pd.DataFrame(rows).to_string(index=False))
+
+    if repay_results:
+        rows = []
+        for name, r in repay_results.items():
+            rows.append({
+                "Model": name,
+                "Train time (s)": round(r.get("train_time_s", float("nan")), 3),
+                "Infer time (ms/sample)": round(r.get("infer_ms_per_sample", float("nan")), 3),
+                "Model size (MB)": round(r.get("model_size_mb", float("nan")), 3),
+                "MAE": round(r.get("mae", float("nan")), 3),
+                "RMSE": round(r.get("rmse", float("nan")), 3),
+            })
+        print("\n=== System Metrics — Repayment Models ===")
+        print(pd.DataFrame(rows).to_string(index=False))
+
+
 def run_end_to_end_probabilistic(df, status_model_preference=("xgb", "rf", "logreg")):
     """
     1) Train status models and pick a model.
@@ -90,6 +120,9 @@ def run_end_to_end_probabilistic(df, status_model_preference=("xgb", "rf", "logr
     REPAY_FEATURES = ["Funded Amount", "Loan Amount", "Country", "Sector"]
     repay_results = train_repayment_time_model(paid_df, REPAY_FEATURES)  # from RepaymentTimePrediction.py
 
+    # System metrics summary (training/inference time, model size, prob. metrics)
+    print_system_summary(status_results, repay_results)
+
     chosen_repay = "xgb" if "xgb" in repay_results else next(iter(repay_results.keys()))
     repay_pipe = repay_results[chosen_repay]["model"]
     print(f"[stage-2] chosen repayment model: {chosen_repay}")
@@ -116,12 +149,21 @@ def run_end_to_end_probabilistic(df, status_model_preference=("xgb", "rf", "logr
     }
 
 
+def print_versions():
+    import sys, platform, numpy as np, pandas as pd, sklearn, xgboost
+    print("\n=== Versions ===")
+    print("Python:", sys.version.split()[0], "| OS:", platform.platform())
+    print("numpy:", np.__version__, "pandas:", pd.__version__,
+          "sklearn:", sklearn.__version__, "xgboost:", xgboost.__version__)
+
+
 if __name__ == "__main__":
+    print_versions()
     df = load_data()
 
     # Separate runs
-    #run_status_prediction(df)
-    #run_repayment_prediction(df)
+    # run_status_prediction(df)
+    # run_repayment_prediction(df)
 
     # end-to-end probabilistic pipeline
     _ = run_end_to_end_probabilistic(df)

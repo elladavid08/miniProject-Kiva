@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import io, joblib
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
@@ -10,7 +11,7 @@ from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from tqdm import tqdm
-import math
+from time import perf_counter
 
 
 def train_repayment_time_model(df, features):
@@ -28,10 +29,12 @@ def train_repayment_time_model(df, features):
     Returns
     -------
     dict
-        Dictionary with results for each model, including fitted pipeline and metrics.
+        Dictionary with results for each model, including fitted pipeline, accuracy metrics,
+        and system metrics (train time, inference time per sample, model size).
     """
 
     # --- Target variable: repayment time ---
+    df = df.copy()
     df["repayment_days"] = (df["Paid Date"] - df["Funded Date"]).dt.days
     df = df.dropna(subset=["repayment_days"])
     df = df[df["repayment_days"] > 0]
@@ -45,12 +48,13 @@ def train_repayment_time_model(df, features):
     )
 
     # --- Preprocessing ---
-    numeric_features = [f for f in features if df[f].dtype in [np.int64, np.float64]]
+    # Use robust dtype checks (works for ints/floats, incl. pandas nullable types)
+    numeric_features = [f for f in features if pd.api.types.is_numeric_dtype(df[f])]
     categorical_features = [f for f in features if f not in numeric_features]
 
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
+        ("scaler", StandardScaler())  # keep as-is; change to with_mean=False only if you must preserve sparsity end-to-end
     ])
 
     categorical_transformer = Pipeline(steps=[
@@ -71,7 +75,8 @@ def train_repayment_time_model(df, features):
         "xgb": XGBRegressor(
             n_estimators=300, learning_rate=0.1, max_depth=6,
             subsample=0.8, colsample_bytree=0.8,
-            random_state=42, n_jobs=-1),
+            random_state=42, n_jobs=-1
+        ),
         "rf": RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
     }
 
@@ -82,16 +87,42 @@ def train_repayment_time_model(df, features):
             ("regressor", model)
         ])
 
-        pipe.fit(X_train, y_train)
-        preds = pipe.predict(X_test)
+        # --- defaults to avoid "might be referenced before assignment"
+        train_time_s = float("nan")
+        infer_ms_per_sample = float("nan")
+        model_size_mb = float("nan")
 
+        # --- Train (timed)
+        t0 = perf_counter()
+        pipe.fit(X_train, y_train)
+        train_time_s = perf_counter() - t0
+
+        # --- Predict on test (timed)
+        t0 = perf_counter()
+        preds = pipe.predict(X_test)
+        infer_ms_per_sample = (perf_counter() - t0) * 1000.0 / max(len(X_test), 1)
+
+        # --- Accuracy metrics
         mae = mean_absolute_error(y_test, preds)
         rmse = np.sqrt(mean_squared_error(y_test, preds))
+
+        # --- Model size (in MB)
+        try:
+            buf = io.BytesIO()
+            joblib.dump(pipe, buf)
+            model_size_mb = len(buf.getbuffer()) / (1024 * 1024)
+        except Exception:
+            # keep NaN on failure
+            pass
 
         results[name] = {
             "model": pipe,
             "mae": mae,
-            "rmse": rmse
+            "rmse": rmse,
+            "train_time_s": train_time_s,
+            "infer_ms_per_sample": infer_ms_per_sample,
+            "model_size_mb": model_size_mb,
         }
 
     return results
+
